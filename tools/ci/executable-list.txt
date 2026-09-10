@@ -113,6 +113,7 @@ tools/mkdfu.py
 tools/mkuf2.py
 tools/python_version_checker.py
 tools/set-submodules-to-github.sh
+tools/silica/bin/silica-compiler
 tools/test_apps/system/no_embedded_paths/check_for_file_paths.py
 tools/test_bsasm/test_bsasm.py
 tools/test_idf_py/test_hints.py

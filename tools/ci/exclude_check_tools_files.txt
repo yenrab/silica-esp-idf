@@ -52,6 +52,7 @@ tools/gdb_panic_server.py
 tools/mocks/**/*
 tools/python_version_checker.py
 tools/set-submodules-to-github.sh
+tools/silica/**/*
 tools/templates/sample_component/CMakeLists.txt
 tools/templates/sample_component/include/main.h
 tools/templates/sample_component/main.c
