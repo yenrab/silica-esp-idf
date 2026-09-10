@@ -112,6 +112,53 @@ reason the integration cannot be a simple "add a CMake language" job.
 6. **Module-name uniqueness** is enforced per component by the wrapper today. Cross-component
    Silica dependencies are deferred (section 8); until then, a Silica program is one component.
 
+### 2.1 The Silica makefiles and how this plan treats them
+
+The Silica project uses GNU make in two separate places. They are handled differently, and
+neither is invoked by this fork.
+
+**Building the compiler itself.** The compiler tree is built with `make -C src`, and
+`make TARGET=<backend>` chooses which emitter is compiled into the resulting binary (the
+backend is a build-time choice, see section 1.2). ESP-IDF never builds its compilers from
+source; gcc and clang arrive as prebuilt archives through `tools/tools.json`, and the Silica
+compiler will arrive the same way. The compiler's own makefiles therefore matter only to
+whoever produces the release archives (requirement W6 in section 3). They are out of scope
+here.
+
+**Building Silica applications.** The compiler repo ships `project_makefiles/`, a drop-in
+application build flow with three stages:
+
+| Stage | What the Silica makefiles do | What this plan does instead |
+|---|---|---|
+| 1. Compile | `topo_silica_config.sh` finds every `.silica`, sorts them by `use` lines with `main.silica` last, writes `silica.config`; `silica_compiler.mk` runs the compiler in a loop until it stops exiting 75 | `tools/silica/silica_build.py` (phase 2) does the same ordering and the same loop, per component, inside the ESP-IDF build directory |
+| 2. Assemble | `%.o: %.sams` rule runs `clang -mmacosx-version-min=... -c -x assembler` under a `-j` sub-make | the generated `.sams` files become `GENERATED` assembly sources of the component library, so Ninja runs the target assembler (`xtensa-esp-elf-gcc`, `riscv32-esp-elf-gcc`, or clang) in parallel with everything else |
+| 3. Link | clang links all objects plus archives listed in `silica.link` into a host executable with a Mach-O stack-size option | nothing; the objects go into the component archive and through ESP-IDF's linker scripts, `ldgen`, and the ELF-to-binary steps like any C object. Archives named in `silica.link` are mapped to component link dependencies (requirement W5) |
+
+Why the flow is reimplemented rather than reused:
+
+* The makefiles are host-specific. They hard-code clang, a macOS minimum-version flag, a
+  Mach-O linker option, and a Homebrew clang path.
+* Their end product is a linked host executable, which has no place in an ESP-IDF build.
+  Only stage 1 carries over unchanged in spirit.
+* Copying them in would couple this repository to the compiler tree, which the ground rules
+  forbid.
+* ESP-IDF's build uses CMake and Ninja on every supported host, and make is not a guaranteed
+  build-time dependency, in particular on Windows.
+
+The three ideas that do carry over, dependency ordering, the exit-75 re-invoke loop, and
+collecting generated files, are kept as the contract items C1 to C3 and C7 in section 3, so a
+change in the compiler's make flow shows up as a contract change rather than as a hidden
+breakage.
+
+**Make-based variant, if preferred.** The custom command in phase 2 could run a small
+ESP-IDF-owned makefile (`tools/silica/silica_build.mk`) whose rules mirror the shapes in
+`project_makefiles/`, so people who know the Silica flow recognise it. The cost is a GNU make
+requirement at build time on every host; ESP-IDF's installer would have to add make to
+`tools/tools.json` for Windows, and the wrapper would still be needed to write the per-component
+`silica.config` and to hand the results back to CMake. This variant is not the default. If it is
+chosen, phase 2 step 1 changes from "Python wrapper" to "Python wrapper plus makefile", and
+nothing else in the plan moves.
+
 ---
 
 ## 3. Interface contract the real compiler must meet
@@ -428,4 +475,5 @@ Modified:
   `IDF_TOOLCHAIN_*` symbols gate C-specific optimisation options.
 * **Vendoring the compiler's `project_makefiles/`.** Rejected: they are macOS/clang specific
   and would couple this repo to the compiler tree. The Python wrapper reimplements the three
-  ideas that matter (topological order, exit-75 loop, generated-file collection).
+  ideas that matter (topological order, exit-75 loop, generated-file collection). See
+  section 2.1 for the stage-by-stage comparison and the make-based variant.
