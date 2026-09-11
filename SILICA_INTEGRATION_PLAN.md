@@ -17,6 +17,21 @@ Ground rules:
   file-level contract and generates no code.
 * Every phase must leave `idf.py build` working unchanged for projects that contain no Silica.
 
+Execution model:
+
+* The Silica compiler is a **host tool that runs on macOS** (Apple Silicon first) and
+  **cross-emits assembly for the Espressif chip** selected by `IDF_TARGET`. It is installed
+  into `IDF_TOOLS_PATH` like gcc and clang and is never run on the device.
+* The compiler's job ends at assembly text. Assembling, archiving, linking, `ldgen`, flash
+  image generation and flashing are all done by this fork with the existing Espressif
+  toolchains, exactly as for C sources.
+* Everything downstream of the emitted assembly lives in this repository: the build-system
+  glue, the runtime component that hosts Silica programs on FreeRTOS, the templates, examples,
+  tests and documentation. Only the emitter backends and the runtime's generated code live in
+  the compiler (requirements W1 and W2 in section 3).
+* Other host operating systems come later, when the compiler is ported. Until then a Silica
+  project configured on Linux or Windows must fail with a clear message, not a mysterious one.
+
 ---
 
 ## 1. Where things stand today
@@ -167,6 +182,15 @@ This is the list to hand to the Silica compiler project. The placeholder impleme
 "build-system" item now so the ESP-IDF side can be tested. Items marked **(compiler work)** are
 prerequisites on the Silica side; the ESP-IDF plumbing cannot make them unnecessary.
 
+Where the compiler work lives: the compiler has one backend directory,
+`src_selfhost/emitter/apple_silicon_mac/` (about 33,500 lines), and every target-specific
+line of the compiler is inside it, including the actor runtime, which the emitter generates
+as assembly text. W1, W2 and the symbol-naming issues are therefore one job: a new
+`emitter/<esp_target>/` tree, which the compiler's existing `make TARGET=` mechanism
+already knows how to select. C1, C3, C4, C5 and W7 live in the driver and diagnostics code
+outside the emitter, and W5 in the frontend FFI checker. Section 5 splits this into work
+packages.
+
 Build-system contract (mimicked by the placeholder):
 
 * C1. Reads `silica.config` from the working directory; one `.silica` path per line.
@@ -180,6 +204,13 @@ Build-system contract (mimicked by the placeholder):
   `is_executable: false` or `tool_info_file`, which the plan uses only for the placeholder.)
 * C5. Target selection: honours `SILICA_TARGET=<esp32|esp32s3|esp32c3|esp32c6|...>` (or a
   `--target` flag once one exists) and fails loudly when the target is unsupported.
+  Today the backend is chosen when the compiler binary is built, so the first cross-emitting
+  release may ship as one binary per chip family instead (for example
+  `silica-compiler-xtensa` and `silica-compiler-riscv32`). The wrapper supports both shapes:
+  it looks for `silica-compiler-<IDF_TARGET>`, then `silica-compiler-<xtensa|riscv32>`, then
+  `silica-compiler` with `SILICA_TARGET` set. Note the compiler's current file naming
+  `silica-<N>-<platform>` describes the host only; a cross-emitting binary needs a name that
+  carries both host and target.
 * C6. Deterministic output: the same sources produce byte-identical `.sams` so Ninja restat
   and ccache-style caching work.
 * C7. Emitted runtime assembly (`__silica_runtime.sams`) must be written into the working
@@ -194,16 +225,21 @@ Compiler work required before firmware can be produced (not mimicked):
   `xTaskCreate`, FreeRTOS queues/semaphores and the ESP-IDF heap (`heap_caps_*`), with the
   Darwin `ulock`/`os_unfair_lock`/QoS dependencies removed. Regions with a `device` space must
   map to DMA-capable or PSRAM heap capabilities.
-* W3. **Inbound entry**: emit or allow a C-callable `void app_main(void)` (or emit
-  `silica_main` and let the runtime component wrap it). Bare `main` is not usable in ESP-IDF.
+* W3. **Inbound entry**: the program entry must be reachable as a C-callable, no-argument
+  function. The compiler emits it as the bare symbol `main` today, which is acceptable because
+  no firmware component defines `main` (the ELF entry is `call_start_cpu0`); the rename to
+  `app_main` is done on the ESP-IDF side (phase 4, "Entry point"). An entry-symbol override in
+  the compiler is welcome but not required.
 * W4. **Inbound FFI** for ISR handlers and FreeRTOS callbacks, or a documented pattern that
   keeps all interrupt work in C and hands events to Silica actors through a queue.
 * W5. FFI sidecars must be able to name ESP-IDF component libraries (for example
   `link_library: "esp_timer"`) without a `dangerous_exposure_source/lib/*.a` copy, or the
   wrapper must synthesize that directory from the component's link line.
-* W6. A per-platform compiler build for **linux-amd64, linux-arm64, macos-arm64, macos-x86_64,
-  win64** (the platforms `tools/tools.json` distinguishes), published as release archives with
-  stable URLs so `idf_tools.py` can install them.
+* W6. A **macos-arm64** compiler build that cross-emits for the Espressif targets, published
+  as a release archive with a stable URL so `idf_tools.py` can install it. Other host
+  platforms that `tools/tools.json` distinguishes (macos-x86_64, linux-amd64, linux-arm64,
+  win64) follow when the compiler is ported; until then the tool entry lists only
+  `macos-arm64`, and `idf_tools.py` reports the tool as unavailable on other hosts.
 * W7. Error messages with file:line:column so `idf.py` hints and IDE integration work.
 
 ---
@@ -235,8 +271,9 @@ Files: `tools/tools.json`, `tools/tools_schema.json` (only if a new key is neede
    `silica-compiler-0.0.0-placeholder-any.tar.gz` under the `any` platform key, with a
    computed `sha256` and `size`. For local development the URL is `file://` to the packaged
    archive in `IDF_TOOLS_PATH/dist`; for CI, host the archive on the fork's GitHub release
-   page. When the real compiler ships (W6), add per-platform versions with status
-   `recommended` and mark the placeholder `deprecated`.
+   page. When the real compiler ships (W6), add a `macos-arm64` version with status
+   `recommended` and mark the placeholder `deprecated`; other platform keys are added as the
+   compiler is ported.
 3. Install entry point. Today `install.sh:32,35` runs `idf_tools.py install --targets=...`
    and then `install-python-env --features=...`; the `--enable-<x>` flags parsed by
    `tools/install_util.py` only select Python-env features, not tools. Add a small extension:
@@ -255,6 +292,7 @@ Files: `tools/cmake/silica.cmake` (new), `tools/cmake/component.cmake`, `tools/c
 
 1. `tools/silica/silica_build.py`: the wrapper described in section 2. Arguments:
    `--compiler`, `--target`, `--work-dir`, `--component-dir`, `--output-list <file>`,
+   `--depfile <file>`, `--entry-symbol <name>` (default `app_main`, see phase 4),
    then the unit paths. It computes the dependency order from `use` lines (port of
    `topo_silica_config.sh` to Python, with `main.silica` last), writes `silica.config`, runs the
    exit-75 loop, verifies every expected `.sams` exists, and writes a depfile so Ninja re-runs
@@ -315,6 +353,48 @@ Files: `components/silica_rt/` (new: `CMakeLists.txt`, `Kconfig`, `silica_rt.c`,
 4. `tools/ci/check_copyright_config.yaml`: add a section for `.silica` files with a
    `new_notice_silica` template (`//` comments per the language) and list `.sams` under
    ignored generated extensions.
+
+**Entry point: how `main.silica` becomes `app_main`.**
+
+The compiler turns any function named `main` into the bare symbol `main`, injects two
+runtime-registry init calls at the top of it, and otherwise emits it as an ordinary function:
+prologue, body, return value in the first argument register, return. It does not call exit.
+Every other function is module-prefixed, so a Silica `fn app_main()` would become
+`main_app_main` and would not be treated as the entry; the rename has to happen after the
+compiler. Three ways, in order of preference:
+
+1. **Rename in the wrapper (default).** `silica_build.py` already treats `main.silica`
+   specially. After assembling it, run `<prefix>objcopy --redefine-sym main=app_main` on the
+   object (both Espressif toolchains ship objcopy; clang builds use `llvm-objcopy`), or rewrite
+   the `.globl main` / `main:` lines in `main.sams` before assembly. Controlled by the
+   build property `SILICA_ENTRY_SYMBOL`, default `app_main`. Works with the placeholder now and
+   with the real compiler unchanged.
+2. **C shim in `silica_rt`.** `void app_main(void)` calls the Silica `main`. This is what step 1
+   above describes. Its extra value is that the shim can run the Silica entry in a dedicated
+   FreeRTOS task with its own stack size instead of on the main task. Use it together with
+   option 1 by setting `SILICA_ENTRY_SYMBOL=silica_main` so the shim calls `silica_main`.
+3. **Compiler flag.** An entry-symbol override in the compiler. Two places in the emitter's
+   symbol naming and one in the entry-injection check. Optional (W3).
+
+Changes that are needed whichever option is chosen:
+
+* **Return value.** Silica's `main` returns an atom or an int64 meant as a process exit code.
+  `app_main` returns void and the FreeRTOS main task deletes itself when it returns. The shim
+  logs the value at info level and ignores it.
+* **Stack.** The macOS makefiles link with a 256 MB stack. The ESP-IDF main task stack is
+  `CONFIG_ESP_MAIN_TASK_STACK_SIZE`, default 3584 bytes. `silica_rt` adds
+  `CONFIG_SILICA_RT_ENTRY_TASK_STACK_SIZE` and runs the entry in its own task (option 2), so
+  the main task size stays untouched.
+* **Lifetime after return.** On macOS, returning from `main` ends the process and every actor.
+  On ESP-IDF, returning from `app_main` leaves other tasks running. The runtime port must
+  define one behaviour; keeping actors alive after the entry returns is the firmware-natural
+  choice and the plan assumes it.
+* **Registry init symbols.** The injected `_silica_pid_registry_init` calls carry the Mach-O
+  underscore. The ELF backend emits them without it, and `silica_rt` provides them (W1, W2).
+* **Section placement.** The symbol lands in `.text` of the component archive; `ldgen`
+  places it in flash like any C function. No linker-script change.
+* **Test marker.** The "Calling app_main()" log line in `components/freertos/app_startup.c`
+  is untouched, so existing pytest expectations hold.
 
 ### Phase 5: `idf.py`, templates and Kconfig
 
@@ -390,23 +470,115 @@ Checklist, to be executed only when W1 to W7 are satisfied:
 
 ---
 
-## 5. Work breakdown and order
+## 5. Work split and parallel plan
 
-| Phase | Depends on | Size | Blocking on Silica? |
-|---|---|---|---|
-| 0 placeholder | none | done | no |
-| 1 tool registration | 0 | small | no (W6 later) |
-| 2 classic build system | 1 | large | no |
-| 3 cmakev2 | 2 | medium | no |
-| 4 runtime component | 2 | medium | partly (W2/W3 for real behaviour) |
-| 5 idf.py + templates | 2, 4 | small | no |
-| 6 example | 4, 5 | small | no |
-| 7 tests | 2 to 6 | medium | no |
-| 8 docs | 2 to 7 | medium | no |
-| 9 swap-in | all, W1 to W7 | small | yes |
+There are two tracks. **Track A** is everything in this fork. **Track B** is everything in
+the Silica compiler repository. They meet only at the contract in section 3 and at the
+acceptance test A8 below. Neither track waits for the other to start; Track A is completed
+against the placeholder, Track B against the contract.
 
-Phases 1 to 8 can be finished entirely against the placeholder. Phase 9 is the only step that
-waits on the compiler.
+### 5.1 Track A: work outside the compiler (this fork)
+
+Each package names the files it owns. Two agents never edit the same file; when a package
+needs a hook in a file owned by another package, it asks that package's owner for the hook.
+
+| ID | Package | Owns | Depends on | Phase |
+|---|---|---|---|---|
+| A1 | Tool registration: `tools.json` entry, placeholder packaging script, install-script hook, `idf_tools.py` export check | `tools/tools.json`, `tools/tools_schema.json`, `tools/silica/package_placeholder.py`, `install.*`, `tools/install_util.py` | none | 1 |
+| A2 | Build wrapper: dependency ordering, `silica.config` writer, exit-75 loop, generated-file collection, depfile, entry-symbol rename, compiler lookup order, non-macOS hint; plus its unit tests | `tools/silica/silica_build.py`, `tools/silica/test/test_silica_build.py` | none (interface frozen in 5.3) | 2, 7 |
+| A3 | Classic CMake glue: `silica.cmake`, hooks in `component.cmake`, `build.cmake`, `utilities.cmake`, `project.cmake`, `toolchain_flags.cmake`, root `CMakeLists.txt`, `project_description.json.in`, version check | `tools/cmake/silica.cmake` and the listed hook points in `tools/cmake/*` and root `CMakeLists.txt` | A2 interface | 2 |
+| A4 | cmakev2 glue | `tools/cmakev2/*` hook points | A3 skeleton (the `__silica_add_sources` signature) | 3 |
+| A5 | Runtime component: `app_main` shim, entry task with its own stack, Kconfig, C runtime API header with stubs, `.silica` copyright section | `components/silica_rt/**`, `tools/ci/check_copyright_config.yaml` | none | 4 |
+| A6 | Templates, `idf.py create-project --silica`, hints | `tools/templates/sample_project_silica/**`, `tools/idf_py_actions/create_ext.py`, `tools/idf_py_actions/hints.yml` | none to write; A3 to verify | 5 |
+| A7 | Example project with README target table and pytest | `examples/get-started/hello_world_silica/**` | A3, A5 | 6 |
+| A8 | Contract and acceptance tests: `test_contract.py` that runs whatever `silica-compiler` is on `PATH` against a fixture and checks C1 to C7; the build-system tests in `tools/test_build_system/test_silica.py` and the `silica_component` fixture | `tools/silica/test/test_contract.py`, `tools/silica/test/fixtures/**`, `tools/test_build_system/test_silica.py`, `tools/test_build_system/build_test_app/silica_component/**` | contract text only for `test_contract.py`; A3 and A4 for the build-system tests | 7 |
+| A9 | Documentation | `docs/en/api-guides/silica.rst`, `docs/en/api-reference/system/silica_rt.rst`, edits to `build-system.rst`, `idf-tools.rst`, root `README.md` | drafts from the plan; final pass after A3 to A7 | 8 |
+| A10 | CI bookkeeping: `.gitlab/ci/rules.yml` pattern, `CODEOWNERS`, removing the temporary exclude line, pre-commit green | `.gitlab/ci/rules.yml`, `.gitlab/CODEOWNERS`, `tools/ci/exclude_check_tools_files.txt`, `tools/ci/executable-list.txt` | last | 7 |
+
+### 5.2 Track B: work inside the compiler (Silica repository)
+
+Described only to the level needed to size and sequence it. Detail belongs in the compiler's
+own design documents.
+
+| ID | Package | Where in the compiler | Depends on | Contract items |
+|---|---|---|---|---|
+| B1 | Driver: `--version`, `--help`, target selection (`SILICA_TARGET` or `--target`, or per-target binaries), unchanged `silica.config` and exit-75 behaviour | `src_selfhost/main_driver*.silica`, `main_lists.silica`, `emit_target.mk` | none | C1, C3, C4, C5 |
+| B2 | Release packaging: a `macos-arm64` archive with `bin/silica-compiler`, stable URL, sha256. Can be done first with the **current** compiler so A1 has a real archive to test against | compiler repo release process | none | W6 |
+| B3 | Runtime design decision: emitted-assembly runtime per ISA (today's shape) **or** emit calls into a C runtime that lives in this fork's `silica_rt` (recommended; see section 6). Must be decided before B4 and B5 start | design document | none | W2 |
+| B4 | RISC-V backend: `emitter/esp_riscv32/` producing GNU-syntax ELF assembly, ilp32 ABI, rv32imc/rv32imac, ELF symbol naming without the Mach-O underscore, section placement, atom/int/string rodata | new emitter tree | B3 | W1, C2, C6, C7 |
+| B5 | Xtensa backend: `emitter/esp_xtensa/`, windowed ABI as used by ESP-IDF, otherwise as B4 | new emitter tree | B3; shares ELF-common pieces with B4 | W1, C2, C6, C7 |
+| B6 | Runtime implementation per B3: either the FreeRTOS-based generated runtime inside B4/B5, or the emitter-side call sequences into the `silica_rt` C API from A5 | emitter tree, or the emitter plus A5's header | B3; A5 header if the C-runtime option is chosen | W2, W3 |
+| B7 | FFI link manifest: allow `link_library` to name an ESP-IDF component without a `dangerous_exposure_source/lib/*.a` copy | `src_selfhost/ffi/ffi_link_manifest.silica` and the checker | none | W5 |
+| B8 | Diagnostics with file:line:column in a fixed format | `src_selfhost/diagnostics/` | none | W7 |
+| B9 | Inbound FFI for ISR and FreeRTOS callbacks, or the documented queue-based pattern | frontend and emitter | B6 | W4 |
+
+### 5.3 Interfaces to freeze first
+
+These are written down before the parallel work starts and changed only by agreement:
+
+1. **The compiler contract** (section 3, C1 to C7). Owner: shared. A8's `test_contract.py`
+   is the executable form of it; both tracks run it.
+2. **The wrapper command line** for `tools/silica/silica_build.py`: `--compiler`,
+   `--target`, `--work-dir`, `--component-dir`, `--output-list`, `--depfile`,
+   `--entry-symbol`, followed by unit paths; exit codes; the format of the output list.
+   Owner: A2. Consumers: A3, A4, A8.
+3. **The `__silica_add_sources(component_lib sources_var)` CMake signature** in
+   `tools/cmake/silica.cmake`. Owner: A3. Consumer: A4.
+4. **The `silica_rt` C API header** (`components/silica_rt/include/silica_rt.h`): entry
+   hook name, spawn, send, region allocation, registry init. Owner: A5. Consumers: B6, A7, A9.
+5. **The tool name and lookup order** (`silica-compiler-<target>`, then
+   `silica-compiler-<xtensa|riscv32>`, then `silica-compiler`). Owner: A1 and B1 jointly.
+
+### 5.4 What runs in parallel
+
+Wave 1, all start at once, no dependencies:
+
+* Track A: A1, A2, A5, A6, A8 (`test_contract.py` and fixtures only), A9 (drafts).
+* Track B: B1, B2, B3, B7, B8.
+
+Wave 2, starts as soon as the named prerequisite lands:
+
+* A3 after the A2 interface (not after A2 is finished).
+* A4 after the A3 skeleton exists.
+* B4 and B5 after the B3 decision; they run in parallel with each other.
+* B6 after B3, and after A5's header if the C-runtime option is chosen.
+
+Wave 3:
+
+* A7 after A3 and A5. A8's build-system tests after A3 and A4. A9 final pass after A3 to A7.
+* B9 after B6.
+
+Wave 4, joint: phase 9 swap-in, once B1, B2, B4 or B5, and B6 pass `test_contract.py` and the
+`hello_world_silica` example runs on hardware.
+
+Suggested agent assignment for this fork, five agents with no shared files:
+
+| Agent | Packages | Notes |
+|---|---|---|
+| 1 | A2, then A3 | Owns the wrapper and the classic glue; publishes the interfaces in 5.3 items 2 and 3 first |
+| 2 | A1, then A4 | Tool registration while waiting for the A3 skeleton |
+| 3 | A5, then A7 | Runtime component, then the example that exercises it |
+| 4 | A8, then A6 | Contract test first so Track B can run it early; templates after |
+| 5 | A9, then A10 | Docs drafted from the plan, CI bookkeeping at the end |
+
+For the compiler repository the natural split is one agent each for B1 with B2, B4, B5,
+B7 with B8, and one for B3 followed by B6 and B9. B4 and B5 should agree on the shared
+ELF-emission helpers before either starts.
+
+### 5.5 Phase-to-package map
+
+| Phase | Packages |
+|---|---|
+| 0 placeholder | done |
+| 1 tool registration | A1 (B2 supplies a real archive later) |
+| 2 classic build system | A2, A3 |
+| 3 cmakev2 | A4 |
+| 4 runtime component | A5 (B3, B6 for real behaviour) |
+| 5 idf.py and templates | A6 |
+| 6 example | A7 |
+| 7 tests | A8, A10 |
+| 8 docs | A9 |
+| 9 swap-in | joint, gated on B1, B2, B4 or B5, B6 |
 
 ---
 
@@ -422,13 +594,24 @@ waits on the compiler.
   property that the wrapper folds into every component's `silica.config`, with `.iface`
   files of already-compiled components passed as inputs once the compiler supports reading
   them without recompiling.
-* **Windows.** The placeholder is a Python script with a shebang. `tools.json` `export_paths`
-  and `idf_tools.py` run it fine on POSIX; on Windows the package must ship a `.cmd` shim or the
-  wrapper must invoke it through `sys.executable`. Decide in phase 1.
+* **Non-macOS hosts.** The real compiler is macOS-only for now. On Linux or Windows the
+  wrapper must fail at configure time with a hint that names the host requirement, and the
+  build-system tests on those hosts run only against the placeholder. The placeholder itself is
+  a Python script with a shebang: fine on POSIX, and on Windows the package must ship a
+  `.cmd` shim or the wrapper must invoke it through `sys.executable`. Decide in phase 1.
 * **Licence.** Confirm the compiler's licence before adding the `tools.json` entry; the
   schema requires a `license` field.
 * **Module basename uniqueness** across a whole firmware image is a language rule, not a build
   rule. It will bite large projects; raise with the language team.
+* **Where the runtime lives (decision B3).** Today the emitter generates the actor runtime as
+  assembly text, about 4,000 lines for one ISA. Reproducing that for Xtensa and RISC-V doubles
+  the backend work and keeps the runtime out of reach of ESP-IDF's debugging tools. The
+  recommended alternative is for the ESP backends to emit calls into a C runtime in this
+  fork's `silica_rt` component, built on FreeRTOS tasks, queues and `heap_caps_*`. That moves
+  most of W2 into Track A, shrinks B4 and B5 to code generation, and makes the runtime
+  testable with ordinary ESP-IDF unit tests. The cost is that the emitter's shape changes from
+  "generate runtime" to "call runtime", so the decision has to come before B4 and B5 start,
+  and the `silica_rt` C API (interface 5.3 item 4) becomes part of the compiler contract.
 * **ccache.** The compiler is not a C compiler, so `IDF_CCACHE_ENABLE` does not cover it.
   Determinism (C6) plus the depfile is the substitute.
 
